@@ -1,174 +1,178 @@
 ---
 name: obsidian-compile
-description: "Reads all new/unseen monorepo chats from Claude Code and Cursor, distills them into detailed chat notes organized by monorepo package path, routes package-scoped plans alongside chats, and builds hierarchical _index.md indexes. Run daily from any project directory."
+description: "Reads all new/unseen AI chat sessions (Claude Code + Cursor) from any project under /Users/ss/Code/, distills each into a chat note routed to the correct ticket folder under projects/{project}/{ticket}/, and maintains a living PROBLEM.md per ticket capturing decisions and current approach. Run daily from any directory. Use this skill whenever the user runs /obsidian-compile, asks to compile chats, wants to sync chat history to the vault, or wants to catch up on what was worked on."
 ---
 
 # Obsidian Compile
 
-Discover new AI chat sessions (Claude Code + Cursor) and Cursor plans since the last compile, distill each into a detailed chat note routed to the correct monorepo package path, and maintain hierarchical `_index.md` indexes at every level. Each chat note captures what was asked, what was implemented, decisions made, and problems solved — no code dumps.
+Discover new AI chat sessions and Cursor plans, distill each into a structured note routed to the right feature ticket, and keep each ticket's `PROBLEM.md` up to date with decisions made and current approach.
 
 **Core philosophy:**
 
-- **Monorepo only.** Only process transcripts from the monorepo project. Skip all other projects.
-- **Package-path routing.** Chat notes live at `chats/monorepo/{monorepo-path}/{title-slug}.md` mirroring the actual monorepo directory hierarchy (e.g., `src/golang/internal.endor.ai/pkg/wiz/`).
-- **`_index.md` is the index layer.** Every directory in the hierarchy gets an `_index.md` that serves as a Map of Content (MOC). Higher-level indexes are architectural summaries; deeper indexes have implementation detail.
-- **Chat notes are append-only.** Once written, a chat note is never modified. Each captures a point-in-time session.
-- **No hardcoded dictionaries.** Discover the existing folder hierarchy at compile time and route new files into it. Create new subfolders as needed.
-- **`__misc__` for unresolvable paths.** Chats that cannot be mapped to a monorepo package go under `chats/monorepo/__misc__/`.
-- **Package-scoped plans.** Plans related to a specific package live inside that package's directory under a `plans/` subfolder.
-- **Skip noise.** Cursor Command sessions for PR reviews and PR creation are skipped entirely.
+- **Ticket-centric.** Work is organized by feature/ticket, not by code package. `projects/{project}/{ticket}/` is the unit of organization.
+- **PROBLEM.md is the living doc.** Each ticket has one `PROBLEM.md` that accumulates goal, current approach, decisions, and open questions over time. Chat notes underneath it are immutable point-in-time records.
+- **Ask when unsure.** If a session can't be matched to a ticket, finish everything else first, then ask the user explicitly.
+- **All Code projects.** Compile sessions from any project under `/Users/ss/Code/` — not just the monorepo.
 
-**Obsidian conventions (follow in ALL generated notes):**
+## Vault Structure
 
-- Tags in frontmatter arrays only — never inline `#tag` in body text
-- Use nested slash tags for hierarchy: `monorepo/pkg/wiz`, `monorepo/service/endorctl`
-- All `[[wikilinks]]` use lowercase-kebab-case — `[[wiz-exporter]]` not `[[Wiz Exporter]]`
-- Every chat note has `up: "[[_index]]"` in frontmatter linking to its parent MOC
-- `_index.md` files list child `_index.md` links first, then chat notes in Contents section
-- No code blocks anywhere — prose only
-- `aliases` in frontmatter for common shorthand names
+```
+~/Code/vault/
+  projects/
+    monorepo/
+      PC-415-scan-new-repo/
+        PROBLEM.md
+        plans/
+          add-direct-project-creation.md
+        implement-scm-agnostic-helpers.md
+        fix-force-flag.md
+    vault/
+      obsidian-compile-redesign/
+        PROBLEM.md
+        brainstorm-ticket-centric-structure.md
+    prompt-injection/
+      prompt-injection-detection/
+        some-ticket/
+          PROBLEM.md
+  meta/
+    compile-state.json
+```
 
 ## Step 1: Load Compile State
 
-Read `~/Code/vault/meta/compile-state.json`. It has this shape:
+Read `~/Code/vault/meta/compile-state.json`:
 
 ```json
 {
-  "last_compiled": "2026-03-12T09:00:00Z",
+  "last_compiled": "2026-03-20T05:58:28Z",
   "seen_sessions": {
-    "claude:SESSION_ID": "2026-03-12T09:00:00Z",
-    "cursor:SESSION_ID": "2026-03-12T09:00:00Z"
+    "claude:SESSION_ID": "2026-03-20T05:58:28Z",
+    "cursor:SESSION_ID": "2026-03-20T05:58:28Z"
   },
   "seen_plans": {
-    "plan_filename_stem": "2026-03-12T09:00:00Z"
+    "plan_filename_stem": "2026-03-20T05:58:28Z"
   }
 }
 ```
 
-If `last_compiled` is null, this is the first run — everything is new.
+If the file doesn't exist or `last_compiled` is null, this is the first run — everything is new.
 
-## Step 2: Discover Vault Structure
+## Step 2: Discover Vault — Build Ticket Registry
 
-Before processing sessions, scan the vault to understand the current layout.
+Scan `~/Code/vault/projects/` recursively. For each directory at depth 2 (e.g., `projects/monorepo/PC-415-scan-new-repo/`):
 
-1. **Scan `chats/monorepo/`**: list all directories recursively to discover existing package paths. This tells you where existing chats live and what subfolders exist.
-
-2. **Build index**: for each directory found, count the number of `.md` files (excluding `_index.md`). This determines which directories already have chat content.
+1. Extract the folder name (e.g., `PC-415-scan-new-repo`)
+2. Parse any Jira-style ticket ID from it using the pattern `[A-Z]+-[0-9]+` (e.g., `PC-415`, `ASE-1330`)
+3. Build a registry with both ticket ID and full folder name for matching:
+   ```
+   {
+     "PC-415": { "path": "projects/monorepo/PC-415-scan-new-repo", "folder": "PC-415-scan-new-repo", "project": "monorepo" },
+     "ASE-1330": { "path": "projects/ghas/ASE-1330-nil-severity", "folder": "ASE-1330-nil-severity", "project": "ghas" }
+   }
+   ```
+4. Also keep a flat list of all folders (with their paths) for fuzzy matching in Step 5.
 
 ## Step 3: Discover Sessions
 
 ### Claude Code transcripts
-- Glob: `~/.claude/projects/-Users-ss-Code-monorepo/*.jsonl`
-- **Skip** any path containing `/subagents/`
-- Session ID: the JSONL filename stem (e.g., `125a519a-92b8-442b-98ee-8faca5cf8277`)
+- Glob: `~/.claude/projects/-Users-ss-Code-*/*.jsonl`
+- **Exclude** the exact directory `-Users-ss-Code` (no suffix) — that's the Code root itself, not a project
+- **Exclude** `-Users-ss-Code-vault` — vault sessions are meta (skill work, note editing) and shouldn't self-compile
+- **Exclude** paths containing `/subagents/`
+- Session ID: the JSONL filename stem
 - State key: `claude:{sessionId}`
+- **Derive project name**: strip the `-Users-ss-Code-` prefix from the directory name, then decode the path. The encoded name uses `-` as separator but directory names also contain `-`, so resolve ambiguity by checking against the real filesystem: list `/Users/ss/Code/` and match the longest prefix that corresponds to a real path. For example, `-Users-ss-Code-prompt-injection-prompt-injection-detection` → check if `Code/prompt-injection` exists, then if `Code/prompt-injection/prompt-injection-detection` exists → project name is `prompt-injection/prompt-injection-detection`.
 
 ### Cursor transcripts
-- Glob: `~/.cursor/projects/Users-ss-Code-monorepo/agent-transcripts/*/*.jsonl`
-- Session ID: the parent directory name (the UUID)
+- Glob: `~/.cursor/projects/Users-ss-Code-*/agent-transcripts/*/*.jsonl`
+- **Exclude** exact directory `Users-ss-Code`
+- **Exclude** `Users-ss-Code-vault`
+- Session ID: the parent directory UUID
 - State key: `cursor:{sessionId}`
+- Derive project name the same way (strip `Users-ss-Code-` prefix, resolve against filesystem)
 
 ### Cursor plans
 - Glob: `~/.cursor/plans/*.plan.md`
-- Plan key: filename stem without `.plan.md`, e.g., `add-s3-exporter_076ec446`
+- Plan key: filename stem without `.plan.md`
 - State key in `seen_plans`
 
-### Filtering: monorepo only
-
-- **Claude Code:** Only glob from `-Users-ss-Code-monorepo` directory. Ignore all other project directories.
-- **Cursor:** Only glob from `Users-ss-Code-monorepo` project directory. Ignore all others.
-
 ### Determine new/updated items
+
 For each discovered file:
-- If its state key is NOT in the seen map → **new**, process it
-- If its state key IS in the seen map but the file's mtime (check via `stat`) is newer than the stored timestamp → **updated**, re-process it
+- If state key NOT in seen map → **new**, process it
+- If state key IS in seen map but file mtime (via `stat`) is newer than stored timestamp → **updated**, re-process it
 - Otherwise → skip
 
-Collect all items to process. If there are none, print "Nothing new to compile." and stop.
+If nothing is new, print "Nothing new to compile." and stop.
 
-If there are more than 30 new sessions, process them in batches. For each batch, read and distill the sessions, write notes, then move to the next batch. This avoids context overload.
+If more than 30 new sessions, process in batches of ~10 to avoid context overload.
 
-## Step 4: Read & Distill Each Chat
+## Step 4: Read & Distill Each Session
 
-For each new/updated session, read the JSONL file. Extract:
+For each new/updated session, read the file. Extract:
 
 ### Claude Code JSONL format
-Each line is a JSON object. Key fields:
-- `type`: `"user"` or `"assistant"` (skip `"file-history-snapshot"`, `"progress"`, etc.)
-- `message.content`: string or array of content blocks
-- `timestamp`: ISO 8601 string
-- `sessionId`: session identifier
-
-Read the user and assistant messages to understand the conversation.
+- Each line is a JSON object with `type`, `message.content`, `timestamp`, `sessionId`
+- Process only `type: "user"` and `type: "assistant"` messages
+- For large files (>500 lines): read first 200 and last 50 lines
 
 ### Cursor JSONL format
-Each line is a JSON object:
-- `role`: `"user"` or `"assistant"`
-- `message.content`: array of `{"type":"text","text":"..."}`
+- Each line: `{ "role": "user"|"assistant", "message": { "content": [{"type":"text","text":"..."}] } }`
+- No timestamps — use file mtime as the date
 
-No timestamps in the content — use the file's mtime as the date.
+### Skip filter
 
-### Skip filter — discard these sessions entirely
+Discard the session entirely (but still mark as seen) if the first user message contains:
+- `Cursor Command: review`
+- `Cursor Command: Create Draft PR`
 
-After reading, check whether the session is a Cursor Command for PR review or PR creation. **Skip the session** (do not write any note, mark it as seen) if:
+These are mechanical operations with no knowledge value.
 
-- The first user message starts with `--- Cursor Command: review ---` or contains `Cursor Command: review`
-- The first user message starts with `--- Cursor Command: Create Draft PR ---` or contains `Cursor Command: Create Draft PR`
+### What to extract
 
-These sessions are mechanical CI/review operations and bloat the vault with no useful knowledge.
+Distill into:
 
-### What to extract from each chat
-
-Distill the conversation into:
-
-1. **Title**: A short descriptive title derived from the main topic (not the first message verbatim). Use lowercase-kebab-case for the filename slug.
-2. **What Was Asked**: A concise summary of all user requests across the session. Use bullet points if there were multiple asks. Do NOT copy the raw query verbatim — summarize what the user wanted in clear language.
-3. **What Was Done**: A detailed account of what the AI actually implemented or changed. Include:
-   - Which files were modified and how
-   - Key logic changes, function signatures added or changed
-   - Build/test outcomes (did it pass? what broke?)
-   - Any iterations or failed approaches before the final solution
-   - Config or infrastructure changes made
-4. **Decisions**: What was decided and why. Each as a bullet point. Use `[[wikilinks]]` for important concepts.
-5. **Problems Solved**: Error → solution pairs. What went wrong, what fixed it.
-6. **Concepts/Topics**: Extract 3-8 concept names that could be `[[wikilinks]]`. These should be reusable topic names like `retry-logic`, `s3-upload`, `exporter-framework`, `error-handling`, `graphql`, `protobuf`, etc. — not chat-specific phrases.
-7. **Monorepo package path**: Determine which monorepo package this chat is primarily about (see Step 5 routing).
+1. **Title**: short descriptive slug in `lowercase-kebab-case` derived from the main topic
+2. **What Was Asked**: concise summary of all user requests — bullet points if multiple. Summarize intent, don't copy verbatim.
+3. **What Was Done**: the most important section. Include: files modified and how, key logic changes, build/test outcomes, any failed approaches before the final solution, config/infra changes.
+4. **Decisions**: what was decided and why, each as a bullet with `[[wikilinks]]` for related concepts
+5. **Problems Solved**: error → solution pairs
+6. **Ticket ID**: scan the full transcript for Jira-style IDs (`[A-Z]+-[0-9]+`). Collect all found. The primary ticket is the one most frequently mentioned, or the one the user was actively fixing/building (not just referencing).
+7. **Topics**: 3-6 concept slugs for tags (e.g., `oauth`, `rate-limiting`, `exporter-framework`)
 
 **Rules:**
-- NO code blocks in the output. Prose only.
-- "What Was Done" should be the most substantial section — this is the core value of the note. Be specific about file names and what changed.
-- If a chat is very short (< 5 meaningful exchanges) or trivial, write a minimal note with just "What Was Asked" and "What Was Done".
-- If you cannot determine a meaningful title, use the first few words of the first user message as a slug.
-- **CRITICAL — wikilink format**: All `[[wikilinks]]` MUST use lowercase-kebab-case. Use `[[wiz-exporter]]` NOT `[[Wiz exporter]]` or `[[Wiz Exporter]]`. Obsidian does NOT convert spaces to hyphens — `[[Wiz exporter]]` looks for `Wiz exporter.md` which doesn't exist. Always use hyphens, never spaces.
+- No code blocks in notes — prose only
+- "What Was Done" should be the most substantial section
+- Short chats (<5 meaningful exchanges): minimal note with just What Was Asked + What Was Done
+- All `[[wikilinks]]` must be `lowercase-kebab-case` — never spaces or Title Case
 
-## Step 5: Route to Monorepo Package Path
+## Step 5: Route Each Session
 
-Determine the correct monorepo package path for each chat.
+For each distilled session, run through these steps in order — stop at the first match:
 
-### Extraction strategy
+1. **Exact ticket ID match**: look up the primary ticket ID in the registry from Step 2.
+   - Found → route there. Done.
 
-1. **Scan for file paths** in the transcript. Look for patterns:
-   - Go import paths: `internal.endor.ai/pkg/wiz`, `internal.endor.ai/service/endorctl/exporter`
-   - Relative file paths: `pkg/wiz/client.go`, `service/endorctl/exporter/plugins/ghas/exporter.go`
-   - Bazel labels: `//src/golang/internal.endor.ai/pkg/wiz:wiz`
+2. **Child/related ticket match**: if the exact ticket isn't in the registry, check whether any *other* ticket IDs found in the transcript *are* in the registry. A session mentioning `PC-416` alongside `PC-415` (which has a folder) likely belongs in the `PC-415` folder — child tickets and related work often live together.
+   - Found a registry match among the secondary ticket IDs → route there. Done.
 
-2. **Normalize to full monorepo path**: strip any `//src/golang/` prefix from bazel labels, strip filename suffixes, and resolve to a directory. The target path is always relative to the monorepo root (e.g., `src/golang/internal.endor.ai/pkg/wiz`).
+3. **Fuzzy folder name match**: if no ticket ID matched at all, look at all existing folder names under `projects/` and judge whether any is semantically related to this session's topic. Consider words in the folder name, the project context, and the session's subject matter. This is intentionally judgment-based — a session about "wiz oauth token refresh" is a strong match for `PC-300-wiz-oauth-client`, not a new folder.
+   - Confident match → route there. Done.
+   - Not confident → route to `projects/__misc__/`. Done.
 
-3. **Choose the dominant package**: the package directory most frequently referenced in the conversation. If multiple packages are referenced equally, pick the one the user was primarily working on (the one being modified, not just imported).
+4. **No match at all** → route to `projects/__misc__/`.
 
-4. **Fallback — `__misc__`**: If no file paths are found in the transcript and the topic cannot be confidently mapped to a package, place the note under `chats/monorepo/__misc__/`. Do NOT place notes at the bare `chats/monorepo/` root.
-
-5. **Write path**: `~/Code/vault/chats/monorepo/{resolved-path}/{title-slug}.md`
-
-If the directory does not exist, create it.
-
-### Dedup check
-
-Before writing, check if the slug already exists anywhere under `chats/monorepo/` using a recursive glob: `chats/monorepo/**/{title-slug}.md`. If it exists at the same path (re-process), overwrite. If it exists at a different path, append `-2`, `-3`, etc. to the slug.
+**Key principle**: prefer routing to an existing folder over creating a new one. When in doubt, `__misc__` — never block or ask mid-run.
 
 ## Step 6: Write Chat Notes
 
-Chat notes are **append-only** — once created, they are never modified.
+For each resolved session, write to `~/Code/vault/projects/{project}/{ticket}/{title-slug}.md`.
+
+Create the directory if it doesn't exist.
+
+**Dedup check**: before writing, glob `projects/**/{title-slug}.md`. If the slug exists at the same path (re-processing), overwrite. If it exists at a different path, append `-2`, `-3`, etc.
+
+Chat notes are **append-only** — never modify an existing note (except when re-processing an updated session).
 
 ### Chat note template
 
@@ -176,54 +180,38 @@ Chat notes are **append-only** — once created, they are never modified.
 ---
 type: chat
 source: {claude-code or cursor}
-project: monorepo
-package: {full-monorepo-path}
-up: "[[_index]]"
+project: {project-name}
+ticket: {TICKET-ID}
 date: {YYYY-MM-DD}
-tags: [chat, monorepo/{slash-separated-package-path}, {topic-slug-1}, {topic-slug-2}]
-aliases: []
+tags: [chat, {project}, {ticket-lowercase}, {topic-slug-1}, {topic-slug-2}]
 session_id: {session-id}
 ---
 # {Title}
 
 ## What Was Asked
-{Concise summary of all user requests in this session. Use bullet points for multiple asks.
-NOT the raw query — summarize what the user wanted.}
+{Concise summary of user requests. Bullet points for multiple asks.}
 
 ## What Was Done
-{Detailed implementation account:
-- Files modified and how
-- Key logic/function changes
-- Build and test results
-- Iterations or failed approaches before final solution}
+{Detailed implementation account: files modified, key logic changes, build/test results, failed approaches.}
 
 ## Decisions
-- {Decision with [[wikilinks]] to related packages}
+- {Decision with [[wikilinks]] to related concepts}
 
 ## Problems Solved
-- {Error or problem encountered → how it was fixed}
+- {Error or problem → how it was fixed}
 
 ## Related
 - [[{concept1}]]
 - [[{concept2}]]
 ```
 
-**Field details:**
-- `package`: the resolved monorepo path, e.g., `src/golang/internal.endor.ai/pkg/wiz`
-- `up`: always `"[[_index]]"` — links to the parent directory's `_index.md` for tree navigation
-- `tags`: include `chat`, the nested package tag (e.g., `monorepo/pkg/wiz`), and 2-5 topic slugs
-- `aliases`: optional shorthand names for the note
-
-If a section would be empty (e.g., no problems were solved), omit that section entirely. "What Was Asked" and "What Was Done" should always be present.
+Omit empty sections. "What Was Asked" and "What Was Done" are always present.
 
 ## Step 7: Write Plan Notes
 
-For each new/updated plan, read the `.plan.md` file.
+For each new/updated Cursor plan, read the `.plan.md` file and determine which ticket it belongs to (scan for Jira IDs in the plan content). Route to `~/Code/vault/projects/{project}/{ticket}/plans/{slug}.md`.
 
-### Plan routing
-
-- **ALL plans go to `~/Code/vault/plans/`**: Cursor plans and any plan notes imported from transcripts must always be written under the top-level `plans/` folder (never under `chats/monorepo/**/plans/`).
-- **Human-friendly naming**: The note filename slug and `# {Plan Name}` should be derived from the plan content (goal/overview/todos) and should NOT just mirror the raw `.plan.md` filename. Prefer short, descriptive slugs (e.g., `wiz-client-refactor.md`, `centralize-log-redaction.md`), and append `-2`, `-3`, etc. on collision.
+If no ticket match, add to the unresolved list.
 
 ### Plan note template
 
@@ -231,189 +219,104 @@ For each new/updated plan, read the `.plan.md` file.
 ---
 type: plan
 source: cursor
-project: {monorepo or other}
+project: {project}
+ticket: {TICKET-ID}
 date: {YYYY-MM-DD from file mtime}
-tags: [plan, {project-tag}, {monorepo-derived-tags}, {topic-tags}]
+tags: [plan, {project}, {ticket-lowercase}, {topic-tags}]
 ---
 # {Plan Name}
 
 ## Overview
-{From plan's overview field}
+{From plan's goal/overview}
 
 ## Status
 - [x] {Completed todo}
 - [ ] {Pending todo}
 
 ## Related
-- [[{concept1}]]
-- [[{concept2}]]
+- [[{concept}]]
 ```
 
-**Tagging rules (plans):**
+## Step 8: Create or Enrich PROBLEM.md
 
-- **project-tag**:
-  - Use `monorepo` if the plan references monorepo paths/targets/packages
-  - Otherwise use `other`
-- **monorepo-derived-tags**:
-  - If the plan references one or more monorepo package paths (file paths, Go imports, Bazel targets), add one or more nested tags like `monorepo/pkg/wiz`, `monorepo/service/endorctl/exporter/plugins/wiz`
-  - If multiple packages are referenced, include up to 3 package tags (pick the most prominent)
-- **topic-tags**:
-  - Add 2-5 additional tag slugs based on the plan themes (e.g., `auth`, `refactor`, `observability`, `sarif`, `rate-limit`, `bazel`, `gomock`)
+For each ticket folder that received new chat notes or plans, update its `PROBLEM.md`.
 
-Do not include `up` or `package` fields for plan notes; plans live in `~/Code/vault/plans/` and are navigated via search/tags.
+`PROBLEM.md` is a **living document** — read the current version, then merge in new information from the sessions just processed. Never blindly overwrite.
 
-The parent package's `_index.md` Contents section should list plan notes under a `### Plans` sub-heading, separate from chat notes.
+### Creating a new PROBLEM.md
 
-## Step 8: Generate `_index.md` Files
-
-`_index.md` files are **living knowledge bases** tied to the monorepo directory hierarchy. They are the **most valuable artifact** of the compile process — far more than just a list of links.
-
-**CRITICAL: An `_index.md` is NOT a plain list of links.** It is a rich, synthesized document that tells a developer everything they need to know about a package by reading the chats. A bare link list is a failure. Every `_index.md` MUST have substantive prose in Overview, and where applicable, Architecture, Key Changes, Patterns, and Decisions sections — all synthesized from the chat notes in that directory.
-
-### When to create or update
-
-After writing all chat notes for this batch:
-
-1. **Collect affected directories**: determine which directories received new chat notes or plan notes.
-
-2. **Walk up to root**: for each affected directory, collect all ancestor directories up to `chats/monorepo/`. Every directory in the ancestry chain needs an `_index.md`.
-
-3. **For each directory (leaf to root)**:
-   - If `_index.md` does not exist → **create** it
-   - If `_index.md` exists → **enrich** it (read existing, merge new info, update Contents)
-
-### Creating a new `_index.md`
-
-**Read ALL chat notes in the directory.** This is non-negotiable — you must read every chat note to synthesize an accurate, rich `_index.md`. Then write the `_index.md` following the template below.
-
-For leaf-level packages (directories with actual chat notes), search the web for additional architecture context about the technology to enrich the Overview and Architecture sections.
-
-For intermediate directories (like `src/`, `src/golang/`, `internal.endor.ai/`), write an architectural summary of what's below based on the chat notes in child directories.
-
-### Enriching an existing `_index.md`
-
-- Read the current content
-- Read the NEW chat note(s) that were just written to this directory
-- Merge new information:
-  - Add new key points not already captured
-  - Add new decisions with their dates
-  - Add new patterns or gotchas
-  - Summarize new changes made in the Key Changes section
-  - If the new chat **contradicts** something, **update** the `_index.md` to reflect the latest understanding
-  - **Rebuild the Contents section** to include all current child `_index.md` links, chat notes, and plan notes
-- Do NOT repeat information already present
-- Preserve existing content that is still valid
-- Update the `updated` field in frontmatter to today's date
-
-### `_index.md` template
+When writing a note to a ticket folder that has no `PROBLEM.md` yet, create one by synthesizing what you know from the chat note(s):
 
 ```markdown
 ---
-type: index
-package: {full-monorepo-path}
+type: problem
+ticket: {JIRA-ID}
+project: {project-name}
+status: in-progress
 updated: {YYYY-MM-DD}
-tags: [index, monorepo/{slash-separated-path}]
-aliases: [{short-name}]
+tags: [problem, {project}, {ticket-lowercase}]
 ---
-# {Package/Directory Name}
+# {Ticket Title — derived from chat content}
 
-## Overview
-{What this package/directory is, its purpose, how it fits in the system.
-This should be a rich paragraph (3-8 sentences) explaining what this package does,
-why it exists, what problem it solves, and how it fits into the broader system.
-Higher-level directories = broad architectural summary of all sub-packages.
-Deeper directories = specific implementation detail about this package.
-Synthesize this from all the chat notes — what was the user building/fixing here?}
+## Goal
+{What this ticket is trying to achieve, synthesized from the chat sessions.}
 
-## Architecture
-{Internal structure, key components, interfaces, dependencies.
-Describe the main types/interfaces, how they interact, what the data flow looks like.
-Mention key files and their roles. Describe the dependency graph.
-Only include for directories that represent actual code packages.
-For intermediate directories like src/ or internal.endor.ai/, omit this section.}
-
-## Key Changes
-{A chronological or thematic summary of what was built, modified, or fixed in this package.
-Synthesize from all chat notes — each chat represents work done. Summarize:
-- What features were added or changed
-- What bugs were fixed and how
-- What refactors were performed
-- What integrations were built
-Group related changes together. This section tells the story of the package's evolution.}
-
-## Patterns
-{Conventions, best practices, gotchas specific to this area.
-Synthesized from all chats — what patterns emerged? What mistakes were made and corrected?
-What conventions does the codebase follow in this area?
-Include auth patterns, error handling approaches, testing strategies, etc.}
+## Current Approach
+{How the problem is being solved — the approach in use as of the latest session.}
 
 ## Decisions
-- {YYYY-MM-DD}: {Decision and rationale, with [[wikilinks]] to related concepts}
+- {YYYY-MM-DD}: {Key decision and rationale}
 
-## Contents
-- [[child-folder/_index|Child Package Name]]
-- [[chat-note-slug]]
-
-### Plans
-- [[plans/plan-note-slug]]
+## Open Questions
+- {Anything unresolved or worth revisiting}
 ```
 
-### Rules for `_index.md` generation
+### Enriching an existing PROBLEM.md
 
-- **NEVER create a bare link list.** Every `_index.md` MUST have a substantive Overview section (minimum 3 sentences) synthesized from the chat notes. If a directory has chat notes, it MUST also have a Key Changes section summarizing what was done.
-- **Hierarchy of detail**: `chats/monorepo/_index.md` is a 5-8 sentence project overview covering the monorepo's purpose, key subsystems, and what kinds of work has been done. `src/golang/_index.md` describes the Go backend architecture and all packages below it. `pkg/wiz/_index.md` has detailed component-level architecture, auth flows, API patterns, every decision made, and a thorough summary of all changes.
-- **Read before writing**: Always read existing content before writing — enrich, never blindly overwrite
-- **Contents section**: list child `_index.md` links first (sub-packages), then chat note links, then plan note links under a `### Plans` sub-heading — keeps the MOC scannable
-- Omit empty sections (e.g., no Architecture for intermediate dirs, no Decisions if none recorded)
-- Use `[[wikilinks]]` in lowercase-kebab-case to cross-reference other packages
-- No code blocks — prose only
-- `up` link is NOT needed in `_index.md` (the parent relationship is implicit from the folder hierarchy)
-
-### What NOT to create
-
-- Do NOT create `_index.md` for empty directories (directories with zero chat notes and zero child directories that have chat notes)
-- Do NOT create trivial indexes for throw-away chats like `lorem-ipsum-test`
+Read current content, read the new chat note(s), then:
+- Update **Current Approach** if the approach has changed or evolved
+- Append new bullets to **Decisions** — never remove existing ones
+- Add or resolve items in **Open Questions**
+- Update the `updated` field to today's date
+- Do NOT repeat information already present
 
 ## Step 9: Update Compile State
 
-Write the updated `compile-state.json` at `~/Code/vault/meta/compile-state.json`:
-- Set `last_compiled` to the current ISO 8601 timestamp
-- Add/update entries in `seen_sessions` with the current timestamp for each processed session (including skipped PR review/creation sessions — mark them seen so they aren't re-processed)
-- Add/update entries in `seen_plans` with the current timestamp for each processed plan
-- Keep all previously seen entries (don't remove them)
 
-## Step 10: Print Summary
+Write the updated `~/Code/vault/meta/compile-state.json`:
+- Set `last_compiled` to current ISO 8601 timestamp
+- Add/update entries in `seen_sessions` for every processed session (including skipped PR sessions)
+- Add/update entries in `seen_plans` for every processed plan
+- Keep all previously seen entries
 
-Print a report like:
+## Step 11: Print Summary
 
 ```
 Obsidian compile complete.
-- 12 new chats processed (8 cursor, 4 claude-code)
-- 3 sessions skipped (PR review/creation)
-- 1 plan imported (2 package-scoped, 1 general)
-- 6 _index.md files created, 2 enriched
-- Packages: pkg/wiz, service/endorctl/exporter/plugins/wiz, service/endorctl/exporter/plugins/ghas
+- 8 sessions processed (5 cursor, 3 claude-code)
+- 2 sessions skipped (PR review/creation)
+- 3 plans imported
+- 4 PROBLEM.md files updated, 1 created
+- 2 sessions routed to __misc__ (no ticket match)
 
 New/updated notes:
-  chats/monorepo/src/golang/internal.endor.ai/pkg/wiz/wiz-auth-import-cycle-resolution.md
-  chats/monorepo/src/golang/internal.endor.ai/pkg/wiz/_index.md (new)
-  chats/monorepo/src/golang/internal.endor.ai/pkg/wiz/plans/wiz-client-refactor.md
-  chats/monorepo/__misc__/cursor-lsp-troubleshooting.md
-  plans/vault-restructure.md
+  projects/monorepo/PC-415-scan-new-repo/implement-scm-agnostic-helpers.md
+  projects/monorepo/PC-415-scan-new-repo/PROBLEM.md (enriched)
+  projects/ghas/ASE-1330-nil-severity/fix-cvss-scientific-notation.md
+  projects/ghas/ASE-1330-nil-severity/PROBLEM.md (created)
+  projects/__misc__/cursor-lsp-troubleshooting.md
+  projects/__misc__/vault-brainstorm-session.md
 ```
 
 ## Important Guidelines
 
-- **Monorepo only**: Skip any transcript not from the monorepo project. This is non-negotiable.
-- **Skip PR reviews and PR creation**: Sessions that are Cursor Command review or Create Draft PR operations must be skipped (but still marked as seen in compile state).
-- **Batch processing**: If there are many sessions (>30), process in batches to avoid context limits. Read ~10 sessions at a time, distill and write, then continue.
-- **Large files**: Some JSONL files may be very large. Read the first 200 lines and last 50 lines to get the gist. If the file is under 500 lines, read it all.
-- **Idempotency**: Running twice without new chats should produce "Nothing new to compile."
-- **Chat notes are append-only**: Never modify an existing chat note (except when re-processing an updated session, which overwrites it).
-- **`_index.md` files are living**: Always read before writing. Enrich, correct, and evolve — never blindly overwrite.
-- **Wikilink format**: All `[[wikilinks]]` MUST be lowercase-kebab-case. NEVER use spaces or Title Case. `[[wiz]]` works, `[[Wiz]]` also works (case insensitive), but `[[Wiz exporter]]` does NOT (space ≠ hyphen).
-- **Vault path**: Always use `~/Code/vault` as the vault root.
-- **File checks**: Use stat/glob to check file existence and mtime, not assumptions.
-- **Internet enrichment**: When creating leaf-level `_index.md` files for packages with chat notes, search the web for relevant documentation about the technology or API to enrich the Overview and Architecture sections. This provides context beyond what the chats contain.
-- **`__misc__` routing**: Any chat that cannot be resolved to a monorepo package path goes under `chats/monorepo/__misc__/`. Never place notes at the bare `chats/monorepo/` root (only `_index.md` lives there).
-- **Package-scoped plans**: Plans that reference specific monorepo packages are written to `chats/monorepo/{package-path}/plans/` not to the top-level `plans/` folder.
+- **All Code projects**: compile sessions from any `/Users/ss/Code/` subdirectory — not just monorepo. Exclude the bare `Code` root itself.
+- **Finish before asking**: always process all resolvable sessions before prompting the user about unresolved ones. Don't block mid-run.
+- **Chat notes are append-only**: never modify an existing chat note (except re-processing an updated session)
+- **PROBLEM.md is living**: always read before writing, enrich and correct, never blindly overwrite
+- **Wikilinks**: all `[[wikilinks]]` must be `lowercase-kebab-case` — spaces break Obsidian links
+- **No code blocks**: prose only in all generated notes
+- **Batching**: if >30 new sessions, process in batches of ~10 to avoid context limits
+- **Large JSONL files**: read first 200 + last 50 lines for files over 500 lines
+- **Idempotency**: running twice with no new sessions should produce "Nothing new to compile."
+- **Vault path**: always use `~/Code/vault` as the vault root
