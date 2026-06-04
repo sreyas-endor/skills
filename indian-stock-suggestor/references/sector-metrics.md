@@ -135,7 +135,9 @@ Asset-intensive, highly leverage-driven; completely different valuation framewor
 
 ---
 
-## Quick Sector P/E Reference (approximate, as of 2025-26)
+## Quick Sector P/E Reference (static snapshot — do NOT quote as current)
+
+This table is a rough orientation captured around 2025-26. Sector P/Es move with market cycles — **always re-verify the current sector P/E via Screener.in peers table or a search before using it in an output**.
 
 | Sector | Typical P/E Range |
 |--------|------------------|

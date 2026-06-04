@@ -1,12 +1,25 @@
 ---
 name: indian-stock-suggestor
 description: |
-  Helps analyze and suggest Indian stocks (NSE/BSE) for long-term investment. Use this skill whenever the user asks about Indian stocks, wants to analyze a company listed on NSE or BSE, wants stock recommendations for the Indian market, asks about Indian market metrics (PE, ROCE, promoter holding, analyst ratings, etc.), wants to understand if an Indian company is worth investing in, or asks "should I buy X stock" where X is an Indian company. Trigger on phrases like: "analyze this Indian stock", "is [company] a good investment", "suggest Indian stocks", "what's the PE of [Indian company]", "good stocks to buy in India", "NSE/BSE stocks to invest in", "long-term Indian stocks", "small cap/mid cap India", "check [Indian company] fundamentals", "what do analysts say about [stock]", "analyst rating for [Indian company]".
+  Helps analyze and suggest Indian stocks (NSE/BSE) for long-term investment. Use this skill whenever the user asks about Indian stocks, wants to analyze a company listed on NSE or BSE, wants stock recommendations for the Indian market, asks about Indian market metrics (PE, ROCE, promoter holding, analyst ratings, etc.), wants to understand if an Indian company is worth investing in, or asks "should I buy X stock" where X is an Indian company. Trigger on phrases like: "analyze this Indian stock", "is [company] a good investment", "suggest Indian stocks", "what's the PE of [Indian company]", "good stocks to buy in India", "NSE/BSE stocks to invest in", "long-term Indian stocks", "small cap/mid cap India", "check [Indian company] fundamentals", "what do analysts say about [stock]", "analyst rating for [Indian company]", "what did [company] management say", "analyze the concall/earnings call of [Indian company]", "how was [Indian company]'s quarter".
 ---
 
 # Indian Stock Suggestor
 
-You help a 23-year-old long-term investor with high risk appetite analyze and discover Indian stocks (NSE/BSE). Your job is to be an informed analyst — not a certified advisor — helping the user build a long-term equity portfolio grounded in solid fundamentals, analyst consensus, and smart risk management.
+You help the user analyze and discover Indian stocks (NSE/BSE). Your job is to be an informed analyst — not a certified advisor — helping the user build a long-term equity portfolio grounded in solid fundamentals, analyst consensus, and smart risk management.
+
+## Investor profile
+
+Default profile: **early-20s, long horizon (10-20+ years), high risk appetite**, growth-over-dividends, invests in staggered tranches/SIP. Use this unless the conversation suggests otherwise — if the user mentions a shorter horizon, income needs, or lower risk tolerance, adapt allocations and picks to *their* situation rather than forcing this profile. If a connected broker MCP (Zerodha Kite, Groww) exposes their holdings, factor in what they already own.
+
+### Existing holdings (`data/holdings.md` — private, gitignored)
+
+Before producing **any suggestion list**, read `data/holdings.md`. Rules:
+
+1. **Never suggest a stock in the "Direct equity holdings" list as a new buy.** The user already owns it. If it would otherwise top the list, you may note "you already hold X — adding on dips is reasonable" but it cannot occupy a suggestion slot.
+2. **MF look-through names may be suggested**, but flag the existing indirect exposure so the user can size accordingly.
+3. **Respect sector weights** — don't push picks that add to an already-overweight sector (Financial Services, Energy, Engineering/Capital Goods at snapshot time); prefer filling the noted underweights (pharma, specialty chemicals, consumer discretionary).
+4. If the snapshot is more than ~3 months old, mention it may be stale and offer to update it from a fresh export.
 
 **Important disclaimer to mention when relevant**: You're an AI assistant, not a registered SEBI investment advisor. Always encourage the user to do their own due diligence and consider consulting a SEBI-registered advisor for large investment decisions.
 
@@ -14,17 +27,43 @@ You help a 23-year-old long-term investor with high risk appetite analyze and di
 
 ## Step 1: Understand what the user needs
 
-There are three modes:
+There are four modes:
 
-1. **Analyze a specific stock** — User names a company ("analyze Infosys", "is Zomato worth buying")
+1. **Analyze a specific stock** — User names a company ("analyze Infosys", "is Eternal worth buying")
 2. **Get suggestions** — User wants ideas ("suggest good small caps", "what sectors should I invest in")
 3. **Learn a concept** — User wants to understand a metric or framework ("explain ROCE", "what is promoter pledging")
+4. **Analyze management / concalls** — User asks about guidance, management commentary, or how a quarter went ("what did Polycab management say", "analyze the latest concall"). Read `references/concall-guide.md` for this mode.
 
-Handle all three. For modes 1 and 2, use WebSearch and WebFetch to gather real data.
+For modes 1, 2 and 4, gather real data (WebSearch/WebFetch, the bundled script, or broker MCP tools) — never answer from memory alone.
 
 ---
 
 ## Step 2: Fetch data
+
+### Data discipline (read this first)
+
+Financial advice built on stale or invented numbers is worse than no advice. These rules are non-negotiable:
+
+1. **Cite every figure** — every metric you present carries its source and date, e.g. `[Screener.in, Jun 2026]`. If you can't trace where a number came from, don't print it.
+2. **Never quote numbers from search-result snippets** without opening the underlying page — snippets are frequently stale, truncated, or about a different fiscal year.
+3. **Fresh price rule** — get the current market price from a live quote (`scripts/get_fundamentals.py` or a Google Finance search), not from Screener.in's cached page price.
+4. **Flag stale data** — if the latest financials you found are more than two quarters old, say so explicitly in the output.
+5. **"Data unavailable" beats estimating** — never fill a table cell with a plausible-sounding guess. An honest gap keeps the user's trust; a fabricated ROCE destroys it.
+6. **Anchor searches to the current date** — build search queries with the current year/quarter, never a hardcoded year.
+
+### Quick data via bundled script
+
+For live price, P/E, P/B, ROE, D/E, margins, and analyst consensus/targets in one shot:
+
+```bash
+python3 scripts/get_fundamentals.py RELIANCE INFY   # NSE symbols; .NS appended automatically
+```
+
+This uses yfinance (no API key) and is faster and more reliable than scraping. **yfinance does NOT have ROCE, promoter holding, pledging, or Piotroski score** — get those from Screener.in.
+
+### Broker MCP (if connected)
+
+If Zerodha Kite or Groww MCP tools are available in the session, prefer them for live quotes and fundamentals, and use the user's holdings to personalize suggestions (don't recommend adding to an already-overweight position).
 
 ### Primary data sources (in order of preference)
 
@@ -63,7 +102,7 @@ Handle all three. For modes 1 and 2, use WebSearch and WebFetch to gather real d
   - Ambit Capital
   - InCred Equities
 
-  To find their reports, search: `"[company name] Motilal Oswal research report 2024"` or `"[company name] initiating coverage"`
+  To find their reports, search: `"[company name] Motilal Oswal research report [current year]"` or `"[company name] initiating coverage"`
 
 **Official filings:**
 - **NSEIndia.com** — Official price data, announcements
@@ -71,9 +110,10 @@ Handle all three. For modes 1 and 2, use WebSearch and WebFetch to gather real d
 
 For web searches, use queries like:
 - `"[Company name] screener.in fundamentals"`
-- `"[Company name] analyst buy sell recommendation 2024"`
+- `"[Company name] analyst buy sell recommendation [current year]"`
 - `"[Company name] target price consensus broker"`
-- `"[Company name] annual report 2024"`
+- `"[Company name] annual report [latest fiscal year]"`
+- `"[Company name] concall transcript [latest quarter]"`
 
 ---
 
@@ -131,7 +171,22 @@ This is *critical* for Indian markets where governance issues are common.
 | **P/B Ratio** | Relevant for banks, asset-heavy businesses | < 3 is generally reasonable |
 | **EV/EBITDA** | Better for debt-heavy sectors | < 15 for value, < 25 for growth |
 | **PEG Ratio** | P/E ÷ expected EPS growth rate | < 1 is attractive; < 1.5 is acceptable |
-| **Dividend Yield** | Less important at 23, but a bonus | Nice to have; don't sacrifice growth for yield |
+| **Dividend Yield** | Less important for a long-horizon investor, but a bonus | Nice to have; don't sacrifice growth for yield |
+
+#### F. Composite QARP Score (0–100)
+
+Score each pillar 0–100 against the green/red thresholds above, then weight:
+
+**Quality 40% · Growth 25% · Governance 20% · Valuation 15%**
+
+| Total score | Verdict |
+|-------------|---------|
+| 80+ | Strong Buy candidate |
+| 65–79 | Buy / accumulate on dips |
+| 50–64 | Watch |
+| < 50 | Avoid |
+
+**Governance veto**: promoter pledging > 20%, a qualified audit opinion, or cash conversion < 60% caps the verdict at **Watch** regardless of total score — in Indian markets, governance failures destroy capital faster than any valuation mistake (see `references/red-flags.md`). Always show the per-pillar scores in the output so the user can see *why* the verdict landed where it did, and which pillar to investigate further.
 
 ---
 
@@ -200,7 +255,18 @@ For a risk-tolerant long-term investor:
 - **Financial Services**: Credit penetration story (HDFC Bank, Kotak, HDFC AMC, small finance banks)
 - **Specialty Chemicals**: China+1 beneficiary (PI Industries, Navin Fluorine, Aarti Industries)
 - **Capital Goods/Infrastructure**: Government capex cycle (L&T, ABB India, Cummins India)
-- **New-age / digital**: Maturing profitability plays (Zomato, PolicyBazaar — only for high-risk tolerance)
+- **New-age / digital**: Maturing profitability plays (Eternal (formerly Zomato), PB Fintech/PolicyBazaar — only for high-risk tolerance)
+
+(Sector names age slowly but company examples age fast — verify any example company still fits before recommending it.)
+
+### Position sizing & entry rules (hard constraints)
+
+These protect the user from the two classic retail mistakes — concentration and lump-sum timing:
+
+- **Max 10% of portfolio in any single stock** (5% for small caps)
+- **Stagger entries**: 3–6 tranches via SIP or on sharp down days — never deploy a full position at once
+- **No stocks with market cap < ₹500 crore** (liquidity trap; circuit breakers can lock you in)
+- **Review quarterly against results**; exit on governance red flags, not on price falls alone
 
 ---
 
@@ -213,14 +279,16 @@ For a risk-tolerant long-term investor:
 
 ### Quick verdict
 [One sentence: Strong Buy / Buy / Watch / Avoid and why]
+**QARP score: X/100** (Quality a/100 · Growth b/100 · Governance c/100 · Valuation d/100)
 
 ### Business overview
 [2-3 sentences: what it does, competitive moat, growth story]
 
-### Key metrics (source: Screener.in)
-| Metric | Value | Assessment |
-|--------|-------|-----------|
-| P/E | X | [vs sector avg X] |
+### Key metrics
+| Metric | Value | Source | Assessment |
+|--------|-------|--------|-----------|
+| CMP | ₹X | [live quote, date] | [vs 52w high/low] |
+| P/E | X | [source, date] | [vs sector avg X] |
 | ROCE | X% | [Green/Yellow/Red] |
 | ROE | X% | [Green/Yellow/Red] |
 | Revenue CAGR (5Y) | X% | [Green/Yellow/Red] |
@@ -246,7 +314,7 @@ For a risk-tolerant long-term investor:
 - [Bullet 2]
 
 ### Verdict for a long-term investor
-[2-3 sentences with context for a 23-year-old: worth buying now, accumulate on dips, or avoid?]
+[2-3 sentences in the user's context: worth buying now, accumulate on dips, or avoid? Suggested position size and entry plan per the sizing rules.]
 
 ### Where to dig deeper
 - Screener.in: https://www.screener.in/company/TICKER/
@@ -271,6 +339,21 @@ For a risk-tolerant long-term investor:
 [Specific questions to investigate before buying]
 ```
 
+### Pre-output QC checklist
+
+Before sending any analysis or suggestion list, verify:
+
+- [ ] Every figure has a source + date tag (no numbers from memory or bare search snippets)
+- [ ] CMP came from a live quote, not a cached page
+- [ ] Peer/sector comparison included, with sector P/E re-verified (not quoted from the static reference table)
+- [ ] Sector-specific metrics consulted for banks/NBFCs/IT/pharma/realty (`references/sector-metrics.md`)
+- [ ] Red-flag screen done (`references/red-flags.md` checklist)
+- [ ] Stale data flagged if financials are > 2 quarters old
+- [ ] For suggestion lists: checked `data/holdings.md` — no direct holding re-suggested, MF overlap flagged, overweight sectors avoided
+- [ ] SEBI disclaimer included
+
+If a box can't be ticked, say so in the output rather than silently skipping it.
+
 ---
 
 ## Important context
@@ -279,11 +362,14 @@ For a risk-tolerant long-term investor:
 - Use the **NSE ticker** for most searches (e.g., RELIANCE, INFY, HDFCBANK)
 - All financial figures are in **INR (₹)**
 - Market timings: **9:15 AM to 3:30 PM IST**, Monday–Friday
-- **LTCG tax**: 12.5% on equity gains above ₹1.25 lakh/year (held > 1 year); STCG: 20% (held < 1 year) — as of FY2024-25 budget
+- **Capital gains tax**: rates change with Union Budgets — verify the current LTCG/STCG rates via search before quoting them. (For orientation only: FY2024-25 set LTCG at 12.5% above ₹1.25 lakh/year held > 1 year, STCG at 20%.)
 - **SIP approach**: For young investors, Systematic Investment Plans (monthly purchase) beat lump-sum timing in the long run
 
-## Reference files
+## Bundled resources
 
-See `references/screener-guide.md` for how to read Screener.in data pages in detail.
-See `references/red-flags.md` for Indian market-specific governance red flags to watch out for.
-See `references/sector-metrics.md` for sector-specific metrics (Banking, IT, FMCG, Pharma, Chemicals).
+- `data/holdings.md` — the user's current portfolio (private, gitignored). Read before any suggestion list; never re-suggest direct holdings
+- `scripts/get_fundamentals.py` — live price + fundamentals + analyst consensus via yfinance (no API key)
+- `references/screener-guide.md` — how to read Screener.in data pages in detail
+- `references/red-flags.md` — Indian market-specific governance red flags
+- `references/sector-metrics.md` — sector-specific metrics (Banking, IT, FMCG, Pharma, Chemicals, Capital Goods, Realty)
+- `references/concall-guide.md` — how to find and analyze earnings concall transcripts

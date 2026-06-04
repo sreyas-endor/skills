@@ -1,0 +1,11 @@
+# Personal financial data — never commit
+indian-stock-suggestor/data/
+us-stock-suggestor/data/
+
+# Skill eval workspaces
+*-workspace/
+
+# Symlinks into ~/.agents/skills (externally managed) — dangling on clone
+caveman
+caveman-compress
+find-skills
