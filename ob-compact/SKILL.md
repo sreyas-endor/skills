@@ -49,11 +49,13 @@ For each match, read its frontmatter to learn its `(project, feature)`. These ar
 
 ## Step 5: Fetch existing tags
 
+Harvest the tag vocabulary directly from the notes' frontmatter:
+
 ```bash
-/Users/ss/Code/vault-indexer/venv/bin/python /Users/ss/Code/vault-indexer/search.py --list tags
+grep -rhF "tags:" ~/Code/vault/memory --include="*.md" 2>/dev/null | sort | uniq -c | sort -rn
 ```
 
-Parse output; use as the tag vocabulary for Step 7.
+Parse the `tags: [...]` lines to build a frequency-ranked tag list; use it as the tag vocabulary for Step 7.
 
 ## Step 6: Synthesize the handoff
 
@@ -125,24 +127,15 @@ tags: [handoff, {project}, {feature}, {topic-1}, {topic-2}]
 
 Omit any section that has nothing real to say. `Problem`, `Goal`, `State`, and `Next Steps` should always be present. Use `path:line` (full path from project root) per global CLAUDE.md.
 
-## Step 9: Reindex
-
-After writing, trigger the semantic indexer so the new/updated note is immediately searchable via `ob-search`:
-
-```bash
-/Users/ss/Code/vault-indexer/venv/bin/python /Users/ss/Code/vault-indexer/index.py --file <path>
-```
-
-The indexer is idempotent — it deletes+reinserts by file hash, so update and new paths are handled identically.
-
-## Step 10: Confirm
+## Step 9: Confirm
 
 Tell the user what was saved:
 
 ```
 Saved to: memory/monorepo/wiz-oauth/2026-03-25-oauth-token-refresh.md
 Action: new (or: updated existing note for this session)
-Indexed.
 
 Captured: problem, goal, state, 4 files changed, 3 next steps.
 ```
+
+The note is immediately searchable via `ob-search`, which reads the vault directly — no indexing step is needed.

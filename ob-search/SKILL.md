@@ -1,232 +1,200 @@
 ---
 name: ob-search
-description: "Semantic hybrid search over the Obsidian vault memory folder (~/Code/vault/memory/) — past session notes, decisions, hacks, workarounds, technical context from prior Claude sessions. Use this skill whenever the user wants to recall past work, look up what they decided, find a prior session on a bug/feature, or reconstruct context they had before. Trigger on phrases like: 'search memory', 'search my notes', 'find in vault', 'search vault', 'recall', 'what did I note about', 'what did I work on', 'past session on', 'remember when we', 'did I write anything about', 'find notes about', 'look up prior', 'what was that thing we', 'recall the decision on'. Also trigger proactively when the user asks about past work, prior decisions, previous sessions, hacks, workarounds, or any context that might already be in their vault memory."
+description: "Agentic search over the Obsidian vault memory folder (~/Code/vault/memory/) — past session notes, decisions, hacks, workarounds, technical context from prior Claude sessions. Use this skill whenever the user wants to recall past work, look up what they decided, find a prior session on a bug/feature, or reconstruct context they had before. Trigger on phrases like: 'search memory', 'search my notes', 'find in vault', 'search vault', 'recall', 'what did I note about', 'what did I work on', 'past session on', 'remember when we', 'did I write anything about', 'find notes about', 'look up prior', 'what was that thing we', 'recall the decision on'. Also trigger proactively when the user asks about past work, prior decisions, previous sessions, hacks, workarounds, or any context that might already be in their vault memory."
 ---
 
 # ob-search
 
-Semantic hybrid retrieval over `~/Code/vault/memory/` — session logs written by `ob-compact`. Combines vector search (nomic-embed) + BM25 (FTS5) via Reciprocal Rank Fusion, with tiered confidence labels.
+Agentic retrieval over `~/Code/vault/memory/` — session handoff notes written by `ob-compact`. There is no index and no search binary: you find notes by reading the vault directly with `Grep`, `Glob`, and `Read`. You are the retrieval engine — formulate query variants, grep, rank by what actually matched, then read the most promising notes and synthesize.
 
-**Scope:** semantic-only over `~/Code/vault/memory/**/*.md`. Does not cover `chats/`, `tasks/`, `plans/`, `daily/`, etc.
+**Scope:** `~/Code/vault/memory/**/*.md` only. Does not cover `chats/`, `tasks/`, `plans/`, `daily/`, etc.
 
-## Command
+## Vault layout — use the path as structured metadata
 
-Always call via the pinned venv Python. Use `--json` so output is machine-readable:
+Notes live at:
 
-```bash
-/Users/ss/Code/vault-indexer/venv/bin/python /Users/ss/Code/vault-indexer/search.py "<query>" --json [options]
+```
+~/Code/vault/memory/{project}/{feature}/{YYYY-MM-DD-short-topic}.md
 ```
 
-## Return structure — every result has these fields
+The path itself carries `project`, `feature`, and `date` — so a `Glob` on the path is often the fastest first cut before you grep content. Each note also has frontmatter:
 
-| Field | Type | Purpose |
-|---|---|---|
-| `note_path` | absolute path | Feed to `Read` tool to get the full note |
-| `project` | string | Frontmatter `project` (e.g. `monorepo`) |
-| `feature` | string | Frontmatter `feature` (e.g. `bug-1119`) |
-| `date` | string | YYYY-MM-DD from frontmatter |
-| `granularity` | `"section"` \| `"whole"` | Chunk scope — one H2 section, or the entire note body |
-| `section` | string \| null | H2 heading for section chunks; null for whole chunks |
-| `content` | string | The actual chunk text, prefixed with `[project/feature § section]` |
-| `tags` | string[] | Tags from the note's frontmatter |
-| `score` | float | Ranking score (mode-dependent) |
-| `score_label` | `"rrf"` \| `"dist"` \| `"bm25"` | How to interpret `score` |
-| `vector_dist` | float \| null | Raw vector distance (null if not in vector candidate pool) |
-| `bm25_rank` | float \| null | Raw BM25 rank (null if not in BM25 candidate pool) |
-| `confidence` | `"high"` \| `"medium"` \| `"low"` | Tiered confidence label |
-| `id` | int | Internal; ignore |
-
-## When to `Read` the full note vs. use `content` as-is
-
-Do **not** call `Read` reflexively — it burns tokens. Rules:
-
-- `granularity: "whole"` → `content` already contains the entire note body. **Do not Read.**
-- `granularity: "section"` + `confidence: "high"` + the chunk answers the question → use `content` as-is.
-- `granularity: "section"` + the answer likely spans multiple sections → `Read note_path` once.
-- User wants the raw markdown / frontmatter / file state → `Read note_path`.
-- Answering across multiple notes → `Read` only the top-1–3 most relevant `note_path`s.
-
-## Query formulation — the single most important rule
-
-The search is **hybrid**: vectors catch paraphrased meaning, BM25 catches literal keywords. The best queries **combine both**:
-
-- **Short identifier alone** (e.g. `BUG-1119`) — works, but lands in LOW confidence because evidence is thin
-- **Pure concept** (e.g. `dead URL provisioning`) — works for paraphrase but may miss ticket numbers
-- **Combined** (e.g. `BUG-1119 dead URL in GitHub check run when provisioning fails`) — **both systems score it high, you get HIGH confidence**
-
-When the user's phrasing is sparse, enrich it with plausible conceptual context before searching. Don't wrap the query in quotes — FTS5 treats quotes as phrase literals.
-
-## Filters
-
-| Flag | Example | Effect |
-|---|---|---|
-| `--top-k N` | `--top-k 10` | Number of results returned (default 5) |
-| `--project X` | `--project monorepo` | Only chunks from this project |
-| `--feature Y` | `--feature bug-1119` | Only chunks from this feature |
-| `--tag A` (repeatable) | `--tag go --tag sarif` | AND semantics — chunk must have all listed tags |
-| `--granularity G` | `--granularity whole` | `section` or `whole` only |
-| `--mode M` | `--mode vector` | `hybrid` (default), `vector`, or `bm25` |
-| `--min-confidence C` | `--min-confidence medium` | Drops results below this tier |
-| `--all-chunks` | `--all-chunks` | Turn off dedup-by-note (see all chunks) |
-
-Use `--mode vector --min-confidence medium` when doing **conceptual paraphrase queries** where you want strong filtering — best precision/recall balance per eval.
-
-## Vocabulary discovery — only when narrowing
-
-If the first broad query returns too many weak results or spans multiple projects, list the available vocabulary and filter down. **Don't run this by default — only when a broad search didn't converge.**
-
-```bash
-# List all tags with note counts
-python search.py --list tags
-
-# List all projects
-python search.py --list projects
-
-# List all features (grouped by project)
-python search.py --list features
+```yaml
+---
+type: handoff
+project: monorepo
+feature: bug-1119
+date: 2026-03-26
+session_id: ...
+github_user: ...
+tags: [handoff, monorepo, bug-1119, github, provisioning]
+---
 ```
 
-## Confidence tiers
+and H2 sections: `Problem`, `Goal`, `State`, `Files Changed`, `Next Steps`, `Decisions`, `Dead Ends`, `Commands`.
 
-- **HIGH** — both vector distance and BM25 rank are strong → top result is reliable, use directly.
-- **MEDIUM** — one signal is strong → top result is likely right, worth verifying by reading or running a tighter query.
-- **LOW** — neither signal is strong. Three cases:
-  - Very short query (1–2 tokens) that's still correct — common for exact-ID searches like `BUG-1119`. Read the note to confirm.
-  - Paraphrased query with no literal overlap — rephrase by adding identifiers or concrete terms.
-  - No good match exists in the corpus — answer the user from general knowledge and note that vault has no coverage.
+## Method
+
+### 1. Extract search terms from the user's request
+
+Pull out two kinds of terms and search for both:
+
+- **Literal identifiers** — ticket IDs (`BUG-1119`), file names, symbol names, error strings, flags. These are exact — grep them verbatim (case-insensitive).
+- **Concepts** — the paraphrased idea (`dead URL when provisioning fails`). Expand into several plausible keyword variants and synonyms, because the note may word it differently than the user did.
+
+If the request is sparse (e.g. just a topic word), brainstorm 3–5 concrete terms the note likely contains before grepping.
+
+### 2. Grep the vault
+
+Run a case-insensitive, files-with-matches grep for each term. Start broad, then narrow.
+
+```bash
+grep -rliE "bug-1119|dead url|provisioning" ~/Code/vault/memory --include="*.md"
+```
+
+- Use alternation (`term1|term2|...`) to cover identifier + concept variants in one pass.
+- `-l` lists matching files; `-c` counts matches per file (a cheap relevance signal); drop `-l` to see matching lines in context.
+- To weigh a hit, follow up with `grep -c` per candidate, or grep the specific lines to see *how* the term is used.
+
+If a first pass returns nothing, loosen: fewer/shorter terms, stem words (`provision` not `provisioning`), try synonyms.
+
+### 3. Narrow with the path when results are broad
+
+If a content grep spans many projects/features, cut by path first, then grep within:
+
+```bash
+# All notes for one project
+ls ~/Code/vault/memory/monorepo/
+
+# All features (subdirs) under a project
+ls -d ~/Code/vault/memory/*/*/
+
+# Notes for a specific feature
+ls ~/Code/vault/memory/monorepo/bug-1119/
+
+# Most recent notes across the vault (date is in the filename)
+ls ~/Code/vault/memory/*/*/*.md | sort -t/ -k9 -r | head
+```
+
+Combine: restrict the grep to a subtree by pointing it at `~/Code/vault/memory/{project}/` or `.../{project}/{feature}/`.
+
+### 4. Rank the candidates
+
+Order by, roughly: literal-ID match > many concept-term hits > few hits. Prefer more recent notes (date in path/frontmatter) when two notes cover the same topic — later handoffs supersede earlier ones. Filter by `tags:` in frontmatter when the user's ask maps to an obvious tag.
+
+### 5. Read the winners — but don't over-read
+
+Reading burns tokens; be selective.
+
+- **Answer is in one note** → `Read` just that note.
+- **Answering across notes** (synthesis / "everything we did on X") → `Read` the top 1–3 only.
+- **You already saw the answer in a grep context line** and it fully answers the question → skip `Read`, cite the note directly.
+- Never `Read` every candidate reflexively — read top-ranked first and stop once the question is answered.
+
+## Vocabulary discovery — only when a broad search didn't converge
+
+If you can't guess the right project/feature/tag, enumerate the vocabulary, then re-search filtered. Don't do this by default.
+
+```bash
+# Tags with frequency
+grep -rhF "tags:" ~/Code/vault/memory --include="*.md" | sort | uniq -c | sort -rn
+
+# Projects
+ls -d ~/Code/vault/memory/*/
+
+# Features grouped by project
+ls -d ~/Code/vault/memory/*/*/
+```
 
 ## Worked examples
 
-### 1. Exact ticket ID (short query, LOW confidence is normal)
+### 1. Exact ticket ID
 
 ```bash
-python search.py "BUG-1119" --json --top-k 3
+grep -rliE "bug-1119" ~/Code/vault/memory --include="*.md"
 ```
 
-Expect top-1 to be the `bug-1119` note with `confidence: "low"` (short queries always land LOW — evidence is thin, but the answer is still correct). `granularity: "whole"` means the full note is in `content` — no `Read` needed.
+Usually a single hit — `Read` it (or, if there are several, prefer the most recent by filename date).
 
-### 2. Combined identifier + concept (preferred form)
+### 2. Identifier + concept together (preferred)
 
 ```bash
-python search.py "BUG-1119 dead URL in GitHub check run when provisioning fails" --json --top-k 3
+grep -rliE "bug-1119|dead url|github check run|provisioning" ~/Code/vault/memory --include="*.md"
 ```
 
-Should return HIGH confidence because both BM25 (`BUG-1119`) and vector (conceptual phrasing) agree. Use `content` directly.
+The note that hits the most terms is almost certainly the answer. Confirm with `grep -c` if several tie, then `Read` the top one.
 
-### 3. Pure paraphrase — rely on vectors
+### 3. Pure paraphrase — expand into keyword variants
+
+User: "understanding how MCP pipes auth and JSON-RPC work."
 
 ```bash
-python search.py "understanding how MCP pipes auth and JSON-RPC work" --json --top-k 3
+grep -rliE "mcp|json-?rpc|auth token|stdio|jsonrpc" ~/Code/vault/memory --include="*.md"
 ```
 
-No ticket ID, pure concept. Returns the mcp architecture note at HIGH confidence. `granularity: "whole"` → `content` is the full note.
+No ID, so lean on synonym coverage. `Read` the strongest hit.
 
-### 4. Section-level lookup (need just the "Decisions Made" part)
+### 4. Section-level lookup — just the decisions
 
 ```bash
-python search.py "decisions about PR comment formatting" --json --top-k 3
+grep -rl "pr comment formatting" ~/Code/vault/memory --include="*.md"
+# then, in the candidate, jump to the Decisions section:
+grep -nA10 "## Decisions" ~/Code/vault/memory/monorepo/bug-1296-.../<note>.md
 ```
 
-Likely returns a `granularity: "section"` hit for `Decisions Made` in `bug-1296-pr-comment-formatting`. If the user only wants decisions, `content` is enough. If they want surrounding context, `Read note_path` once.
-
-### 5. Filter by project — scope to one codebase
+### 5. Scope to one project
 
 ```bash
-python search.py "integration test broken" --json --project monorepo --top-k 5
+grep -rliE "integration test|broken" ~/Code/vault/memory/monorepo --include="*.md"
 ```
 
-Narrows to the monorepo project. Useful when the user's query could match multiple projects and you want to disambiguate.
-
-### 6. Filter by feature — zoom into a specific bug/feature
+### 6. Scope to one feature
 
 ```bash
-python search.py "migration script" --json --feature bug-1415 --top-k 5
+grep -rliE "migration script" ~/Code/vault/memory/monorepo/bug-1415 --include="*.md"
 ```
-
-Returns only chunks from the bug-1415 feature directory.
 
 ### 7. Vocabulary discovery → then filter
 
 ```bash
-# User asks: "what do we have on authentication?"
-python search.py --list tags
-# output includes: 3  authentication, 2  mcp, ...
-
-python search.py "authentication flow" --json --tag authentication --top-k 5
+grep -rhF "tags:" ~/Code/vault/memory --include="*.md" | sort | uniq -c | sort -rn
+# see: authentication appears in a few notes, then:
+grep -rliE "authentication|oauth|login flow" ~/Code/vault/memory --include="*.md"
 ```
 
-Two-step: fetch the tag vocabulary, pick the right tag, run a filtered search.
+### 8. Exact-text / error-string recall
 
-### 8. Multi-tag AND filter
+The user quotes something from code or a log:
 
 ```bash
-python search.py "fork PR review issues" --json --tag go --tag integration-test --top-k 5
+grep -rlF "context.id == prRunUuid" ~/Code/vault/memory --include="*.md"
 ```
 
-AND semantics: chunk must have **both** tags.
+Use `-F` (fixed string) for literal code/error text so regex metacharacters aren't interpreted.
 
-### 9. Low-confidence → rephrase
+### 9. No hit → loosen and retry
 
-First attempt:
 ```bash
-python search.py "that migration thing" --json --top-k 3
+grep -rliE "that migration thing" ~/Code/vault/memory --include="*.md"   # nothing
+# stem + concrete terms:
+grep -rliE "migrat|azure devops|platform source" ~/Code/vault/memory --include="*.md"
 ```
-
-If top result is LOW with weak distance — rephrase with more concrete terms:
-```bash
-python search.py "migration script platform source Azure DevOps" --json --top-k 3
-```
-
-Expect HIGH confidence on the second try.
 
 ### 10. Multi-note synthesis
 
-User asks: "summarize everything we've done on the AGENTS.md work."
+User: "summarize everything we've done on the AGENTS.md work."
 
 ```bash
-python search.py "AGENTS.md skill loader subagent layout cost experiments" --json --feature agentic-monorepo --top-k 5
+ls ~/Code/vault/memory/monorepo/agentic-monorepo/
+grep -rliE "agents\.md|skill loader|subagent" ~/Code/vault/memory/monorepo/agentic-monorepo --include="*.md"
 ```
 
-Returns ~4 notes. `Read` the top 3 `note_path`s for full context, then synthesize. Use the `tags`, `date`, and `section` fields to group/order the results in the response.
-
-### 11. Mode comparison when one mode underperforms
-
-Paraphrase query with strong semantic but weak keyword overlap:
-```bash
-python search.py "clickable file paths in terminal output" --json --mode vector --min-confidence medium --top-k 5
-```
-
-Pure vector mode avoids BM25 noise. `--min-confidence medium` filters weak matches.
-
-### 12. BM25-only for exact-text recall
-
-User wants "the note that has exactly this error message":
-```bash
-python search.py "context.id == prRunUuid" --json --mode bm25 --top-k 5
-```
-
-BM25 finds literal string matches. Useful when the user quotes something from code.
-
-### 13. Strict narrowing — "only the Decisions sections across the vault"
-
-```bash
-python search.py "decision on X" --json --granularity section --top-k 10
-```
-
-Combined with natural-language search, this surfaces only section chunks, which is useful when hunting for specific decision points.
-
-### 14. Filter-first flow — "tell me every note about the MCP server"
-
-```bash
-python search.py "MCP server" --json --feature mcpserver --top-k 10 --granularity whole
-```
-
-Limits to whole-note chunks of one feature. Each result's `content` is a full note — iterate and synthesize without any `Read` calls.
+`Read` the top 1–3, order by date, synthesize; use each note's `tags`/`date` to group the answer.
 
 ## How to answer the user
 
-After searching, cite the source note in your response using the full relative path with no line number (these are markdown, not code):
+Cite the source note using its full relative path with no line number (these are markdown, not code):
 
 > Based on [memory/monorepo/bug-1119/2026-03-26-dead-url-brainstorm.md]: the fix is to check `p.sc == nil` in `OnFinish`...
 
-Prefer quoting or paraphrasing from `content` over generating new prose — the note captured what was decided, don't override it.
+Prefer quoting or paraphrasing what the note actually says over generating new prose — the note captured what was decided; don't override it. If nothing in the vault matches after loosening the search, say so plainly and answer from general knowledge instead of implying coverage that isn't there.
